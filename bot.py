@@ -79,7 +79,7 @@ async def on_text(update, context):
             await update.message.reply_text(f"Не удалось обновить: {e}")
 
     else:
-        await update.message.reply_text("Сначала выберите действие кнопкой выше.")
+        await update.message.reply_text("Сначала выберите действие в панели клавиатуры: 'Новая задача' или 'Изменить существующую задачу'")
 
 
 def main():
