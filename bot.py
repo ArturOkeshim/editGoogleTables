@@ -103,11 +103,15 @@ async def on_text(update, context):
     editor = context.application.bot_data.get("editor")
 
     if not editor:
-        await update.message.reply_text("Ошибка: таблица не подключена.")
+        await update.message.reply_text(
+            "Ошибка: таблица не подключена.",
+            reply_markup=KEYBOARD,
+        )
         return
     if not sheet_name:
         await update.message.reply_text(
             "Не выбран объект. Сначала выберите действие и объект.",
+            reply_markup=KEYBOARD,
         )
         return
 
@@ -122,9 +126,19 @@ async def on_text(update, context):
         try:
             task_dict = Editor.decipher_add_task_command(text, client)
             editor.insert_info(task_dict, sheet_name=sheet_name)
-            await status_msg.edit_text(f"Готово: задача добавлена в таблицу ({sheet_name}).")
+            task_title = (task_dict.get("task") or "").strip()
+            await status_msg.edit_text(
+                f'Готово: задача "{task_title}" добавлена в таблицу ({sheet_name}).'
+            )
         except Exception as e:
             await status_msg.edit_text(f"Не удалось добавить задачу: {e}")
+        finally:
+            # Сбрасываем выбранный лист и возвращаем основную клавиатуру
+            context.user_data.pop("sheet", None)
+            await update.message.reply_text(
+                "Выберите следующее действие:",
+                reply_markup=KEYBOARD,
+            )
 
     elif mode == "update":
         status_msg = await update.message.reply_text("Обрабатываю изменения, подождите...")
@@ -142,13 +156,24 @@ async def on_text(update, context):
                 await status_msg.edit_text("Не понял, что нужно изменить.")
                 return
             editor.update_info(result, sheet_name=sheet_name)
-            row = result["matched_rows"][0]
-            await status_msg.edit_text(f"Готово. Обновил строку {row-3} на листе {sheet_name}.")
+            chat_reply = (result.get("chat_reply") or "").strip()
+            reply_text = chat_reply or f"Готово. Обновил строку {result['matched_rows'][0] - 3} на листе {sheet_name}."
+            await status_msg.edit_text(reply_text)
         except Exception as e:
             await status_msg.edit_text(f"Не удалось обновить: {e}")
+        finally:
+            # Сбрасываем выбранный лист и возвращаем основную клавиатуру
+            context.user_data.pop("sheet", None)
+            await update.message.reply_text(
+                "Выберите следующее действие:",
+                reply_markup=KEYBOARD,
+            )
 
     else:
-        await update.message.reply_text("Сначала выберите действие в панели клавиатуры: 'Новая задача' или 'Изменить существующую задачу'")
+        await update.message.reply_text(
+            "Сначала выберите действие в панели клавиатуры: 'Новая задача' или 'Изменить существующую задачу'",
+            reply_markup=KEYBOARD,
+        )
 
 
 def main():
