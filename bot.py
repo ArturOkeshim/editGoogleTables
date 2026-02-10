@@ -6,10 +6,11 @@ import asyncio
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
+from telegram.error import TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from script import Editor, client
+from script import Editor, client, transcribe_voice
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -23,18 +24,24 @@ KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+BTN_NEW = "Новая задача"
+BTN_UPDATE = "Изменить существующую задачу"
+BTN_BACK = "Назад"
+
 SHEET_CHOICE_KEYBOARD = ReplyKeyboardMarkup(
-    [["БСА","ЛАПТЕВ","ПУЗАНОВ","АКВА"]],
+    [["БСА", "ЛАПТЕВ", "ПУЗАНОВ", "АКВА"], [BTN_BACK]],
     resize_keyboard=True,
 )
 
-BTN_NEW = "Новая задача"
-BTN_UPDATE = "Изменить существующую задачу"
+TEXT_STAGE_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_BACK]],
+    resize_keyboard=True,
+)
 
-BTN_BCA= "БСА"
-BTN_LAPTEV= "ЛАПТЕВ"
-BTN_PUZANOV= "ПУЗАНОВ"
-BTN_AQUA= "АКВА"
+BTN_BCA = "БСА"
+BTN_LAPTEV = "ЛАПТЕВ"
+BTN_PUZANOV = "ПУЗАНОВ"
+BTN_AQUA = "АКВА"
 
 SHEET_BUTTONS = [BTN_BCA, BTN_LAPTEV, BTN_PUZANOV, BTN_AQUA]
 
@@ -69,6 +76,32 @@ async def on_button(update, context):
             reply_markup=SHEET_CHOICE_KEYBOARD,
         )
 
+    # Кнопка «Назад» — отмена / шаг назад
+    elif text == BTN_BACK:
+        mode = context.user_data.get("mode")
+        sheet = context.user_data.get("sheet")
+
+        # Если уже выбраны и режим, и объект — возвращаемся к выбору объекта
+        if mode and sheet:
+            context.user_data.pop("sheet", None)
+            await update.message.reply_text(
+                "Выберите объект:",
+                reply_markup=SHEET_CHOICE_KEYBOARD,
+            )
+        # Если выбран только режим — возвращаемся к выбору действия
+        elif mode and not sheet:
+            context.user_data.pop("mode", None)
+            await update.message.reply_text(
+                "Выберите действие:",
+                reply_markup=KEYBOARD,
+            )
+        # Если ничего не выбрано — просто показываем основное меню
+        else:
+            await update.message.reply_text(
+                "Вы уже в начале. Выберите действие:",
+                reply_markup=KEYBOARD,
+            )
+
     # Шаг 2: выбор объекта / листа
     elif text in SHEET_BUTTONS:
         context.user_data["sheet"] = text
@@ -76,12 +109,12 @@ async def on_button(update, context):
         if mode == "new":
             await update.message.reply_text(
                 "Напишите, что нужно сделать (опишите задачу).",
-                reply_markup=ReplyKeyboardRemove(),
+                reply_markup=TEXT_STAGE_KEYBOARD,
             )
         elif mode == "update":
             await update.message.reply_text(
                 "Напишите, что нужно изменить (например: «задача по отчёту выполнена»).",
-                reply_markup=ReplyKeyboardRemove(),
+                reply_markup=TEXT_STAGE_KEYBOARD,
             )
         else:
             # Объект выбран без выбранного действия — просим начать сначала
@@ -97,7 +130,12 @@ async def on_button(update, context):
 
 async def on_text(update, context):
     """Текстовое сообщение: если выбран режим — вызываем логику script.py и отвечаем результатом."""
-    text = (update.message.text or "").strip()
+    # Текст может прийти либо напрямую из сообщения, либо быть заранее
+    # сохранён в user_data (например, после транскрибации голосового сообщения).
+    raw_text = context.user_data.pop("pending_text", None)
+    if raw_text is None:
+        raw_text = update.message.text or ""
+    text = raw_text.strip()
     mode = context.user_data.get("mode")
     sheet_name = context.user_data.get("sheet")
     editor = context.application.bot_data.get("editor")
@@ -176,6 +214,58 @@ async def on_text(update, context):
         )
 
 
+async def on_voice(update, context):
+    """
+    Обработка голосового сообщения.
+    Если пользователь находится на шаге ввода команды (после выбора действия и объекта),
+    голосовое сообщение транскрибируется и дальше обрабатывается так же, как текст.
+    """
+    mode = context.user_data.get("mode")
+    sheet_name = context.user_data.get("sheet")
+
+    # Голосовое сообщение имеет смысл только на шаге ввода команды
+    if not mode or not sheet_name:
+        await update.message.reply_text(
+            "Сначала выберите действие и объект с помощью кнопок.",
+            reply_markup=KEYBOARD,
+        )
+        return
+
+    voice = update.message.voice
+    if not voice:
+        await update.message.reply_text("Не удалось прочитать голосовое сообщение.")
+        return
+
+    # Скачиваем файл голосового сообщения
+    temp_path = f"voice_{update.effective_user.id}_{voice.file_unique_id}.ogg"
+    try:
+        tg_file = await voice.get_file()
+        await tg_file.download_to_drive(temp_path)
+    except TimedOut:
+        await update.message.reply_text(
+            "Не удалось загрузить голосовое сообщение (таймаут). Попробуйте ещё раз или напишите текст.",
+            reply_markup=TEXT_STAGE_KEYBOARD,
+        )
+        return
+
+    try:
+        # Транскрибируем аудио в текст через VseGPT / OpenAI
+        text = transcribe_voice(temp_path, client)
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось транскрибировать голосовое сообщение: {e}")
+        return
+    finally:
+        # Пытаемся удалить временный файл (если это нужно)
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+    # Сохраняем текст в user_data и передаём дальше в стандартную логику
+    context.user_data["pending_text"] = text
+    await on_text(update, context)
+
+
 def main():
     # Для Python 3.14: явно создаём и назначаем event loop,
     # иначе asyncio.get_event_loop() внутри библиотеки кидает RuntimeError.
@@ -185,8 +275,8 @@ def main():
 
     request = HTTPXRequest(
         connect_timeout=30,
-        read_timeout=30,
-        write_timeout=30,
+        read_timeout=90,   # увеличен для скачивания голосовых файлов
+        write_timeout=60,
         proxy=PROXY or None,
     )
     app = (
@@ -198,6 +288,7 @@ def main():
     app.bot_data["editor"] = editor
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_button))
 
     app.run_polling(allowed_updates=["message"])

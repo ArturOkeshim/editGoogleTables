@@ -227,33 +227,26 @@ class Editor:
         chat_reply = (data.get("Ответ в чате") or "").strip()
         return {"matched_rows": matched, "changes": changes, "chat_reply": chat_reply}
 
-    def test_insert(self):
-        task_command_1 = "Петрову нужно к пятнице сделать отчёт по продажам за январь, приоритет высокий"
-        task_command_2 = "Связаться с подрядчиком по поводу ремонта"  # нет срока, ответственного, приоритета
-        task_command_3 = "Поручи Марине срочно заказать канцелярию, сделать надо через два дня"  # имя не в именительном
-        task_command_4 = "ну чо там с презентацией для клиента хз когда но надо бы"  # хаос, нет дат
-        task_command_5 = "Алексей — согласовать договор ASAP, в комментах уточнить условия оплаты"  # англ. приоритет
-        task_command_6 = "когда будет время пусть Ольга посмотрит старые счета, не срочно"  # приоритет «низкий»
-        task_command_7 = "до среды ивану подготовить зал к совещанию: стулья, проектор, флипчарт"  # «до среды», подзадачи в тексте
 
+def transcribe_voice(file_path: str, client: OpenAI) -> str:
+    """
+    Транскрибирует голосовое сообщение в текст через VseGPT (Whisper).
+    Логика совпадает с transcribe.py для тестов вне бота.
+    """
+    with open(file_path, "rb") as audio_file:
+        response = client.audio.transcriptions.create(
+            model="stt-openai/whisper-v3-turbo",
+            response_format="json",
+            language="ru",
+            file=audio_file,
+        )
 
+    if hasattr(response, "text"):
+        return response.text
+    if isinstance(response, dict) and "text" in response:
+        return str(response["text"])
+    return str(response)
 
-        commands = [
-        ("1_полные_данные", task_command_1),
-        ("2_минимум_данных", task_command_2),
-        ("3_имя_не_именительный", task_command_3),
-        ("4_хаотичное", task_command_4),
-        ("5_ASAP", task_command_5),
-        ("6_не_срочно", task_command_6),
-        ("7_до_среды_подзадачи", task_command_7),
-        ]
-
-        for name, cmd in commands:
-            print(f"\n--- {name}: {cmd[:50]}...")
-            result = Editor.decipher_add_task_command(cmd, client)
-            print(result)
-            # Раскомментируй, чтобы реально добавлять задачу в таблицу:
-            bot.insert_info(result)
 
 # Запуск тестов
 if __name__ == "__main__":
