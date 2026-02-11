@@ -15,21 +15,27 @@ from script import Editor, client, transcribe_voice
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PROXY = os.getenv("TELEGRAM_PROXY")
-CREDENTIALS_PATH = "calm-photon-486609-u4-96ce79c043ec.json"
+# Путь к JSON ключу Google; на сервере можно задать через .env (CREDENTIALS_PATH).
+CREDENTIALS_PATH = os.getenv("CREDENTIALS_PATH", "calm-photon-486609-u4-96ce79c043ec.json")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-
-
-KEYBOARD = ReplyKeyboardMarkup(
-    [["Новая задача", "Изменить существующую задачу"]],
-    resize_keyboard=True,
-)
 
 BTN_NEW = "Новая задача"
 BTN_UPDATE = "Изменить существующую задачу"
 BTN_BACK = "Назад"
+BTN_CANCEL = "Отменить последнее изменение"
+
+BTN_BCA = "БСА"
+BTN_LAPTEV = "ЛАПТЕВ"
+BTN_PUZANOV = "ПУЗАНОВ"
+BTN_AQUA = "АКВА"
+
+KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_NEW, BTN_UPDATE]],
+    resize_keyboard=True,
+)
 
 SHEET_CHOICE_KEYBOARD = ReplyKeyboardMarkup(
-    [["БСА", "ЛАПТЕВ", "ПУЗАНОВ", "АКВА"], [BTN_BACK]],
+    [[BTN_BCA, BTN_LAPTEV, BTN_PUZANOV, BTN_AQUA], [BTN_BACK]],
     resize_keyboard=True,
 )
 
@@ -37,18 +43,19 @@ TEXT_STAGE_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_BACK]],
     resize_keyboard=True,
 )
+KEYBOARD_WITH_CANCEL = ReplyKeyboardMarkup(
+    [[BTN_NEW, BTN_UPDATE], [BTN_CANCEL]],
+    resize_keyboard=True,
+)
 
-BTN_BCA = "БСА"
-BTN_LAPTEV = "ЛАПТЕВ"
-BTN_PUZANOV = "ПУЗАНОВ"
-BTN_AQUA = "АКВА"
 
 SHEET_BUTTONS = [BTN_BCA, BTN_LAPTEV, BTN_PUZANOV, BTN_AQUA]
 
 async def start(update, context):
     context.user_data.pop("mode", None)
     context.user_data.pop("sheet", None)
-    await update.message.reply_text("Выберите действие:", reply_markup=KEYBOARD)
+    main_keyboard = KEYBOARD_WITH_CANCEL if context.user_data.get("last_change") else KEYBOARD
+    await update.message.reply_text("Выберите действие:", reply_markup=main_keyboard)
 
 
 async def on_button(update, context):
@@ -80,6 +87,7 @@ async def on_button(update, context):
     elif text == BTN_BACK:
         mode = context.user_data.get("mode")
         sheet = context.user_data.get("sheet")
+        has_undo = context.user_data.get("last_change") is not None
 
         # Если уже выбраны и режим, и объект — возвращаемся к выбору объекта
         if mode and sheet:
@@ -91,14 +99,60 @@ async def on_button(update, context):
         # Если выбран только режим — возвращаемся к выбору действия
         elif mode and not sheet:
             context.user_data.pop("mode", None)
+            main_keyboard = KEYBOARD_WITH_CANCEL if has_undo else KEYBOARD
             await update.message.reply_text(
                 "Выберите действие:",
-                reply_markup=KEYBOARD,
+                reply_markup=main_keyboard,
             )
         # Если ничего не выбрано — просто показываем основное меню
         else:
+            main_keyboard = KEYBOARD_WITH_CANCEL if has_undo else KEYBOARD
             await update.message.reply_text(
                 "Вы уже в начале. Выберите действие:",
+                reply_markup=main_keyboard,
+            )
+    elif text == BTN_CANCEL:
+        # Отмена последнего изменения (добавление или обновление задачи).
+        editor = context.application.bot_data.get("editor")
+        last_change = context.user_data.get("last_change")
+        if not editor or not last_change:
+            await update.message.reply_text(
+                "Нет последнего изменения, которое можно отменить.",
+                reply_markup=KEYBOARD,
+            )
+            return
+
+        kind = last_change.get("kind")
+        sheet_name = last_change.get("sheet")
+        try:
+            if kind == "insert":
+                row = last_change.get("row")
+                if row:
+                    editor.delete_row(row_num=row, sheet_name=sheet_name)
+            elif kind == "update":
+                row = last_change.get("row")
+                old_values = last_change.get("old_values") or {}
+                if row and old_values:
+                    # Используем update_info с "откатными" значениями.
+                    revert_result = {
+                        "matched_rows": [row],
+                        "changes": old_values,
+                    }
+                    editor.update_info(revert_result, sheet_name=sheet_name)
+            else:
+                await update.message.reply_text(
+                "Не получилось определить, какое изменение отменять.",
+                reply_markup=KEYBOARD,
+            )
+            # Если отмена прошла без исключений — очищаем сохранённое изменение.
+            context.user_data.pop("last_change", None)
+            await update.message.reply_text(
+                "Последнее изменение отменено.",
+                reply_markup=KEYBOARD,
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"Не удалось отменить последнее изменение: {e}",
                 reply_markup=KEYBOARD,
             )
 
@@ -163,7 +217,13 @@ async def on_text(update, context):
         context.user_data.pop("mode", None)
         try:
             task_dict = Editor.decipher_add_task_command(text, client)
-            editor.insert_info(task_dict, sheet_name=sheet_name)
+            row_num = editor.insert_info(task_dict, sheet_name=sheet_name)
+            # Сохраняем последнее изменение для возможной отмены.
+            context.user_data["last_change"] = {
+                "kind": "insert",
+                "sheet": sheet_name,
+                "row": row_num,
+            }
             task_title = (task_dict.get("task") or "").strip()
             await status_msg.edit_text(
                 f'Готово: задача "{task_title}" добавлена в таблицу ({sheet_name}).'
@@ -175,7 +235,7 @@ async def on_text(update, context):
             context.user_data.pop("sheet", None)
             await update.message.reply_text(
                 "Выберите следующее действие:",
-                reply_markup=KEYBOARD,
+                reply_markup=KEYBOARD_WITH_CANCEL,
             )
 
     elif mode == "update":
@@ -193,6 +253,24 @@ async def on_text(update, context):
             if not result.get("changes"):
                 await status_msg.edit_text("Не понял, что нужно изменить.")
                 return
+
+            # Сохраняем исходные значения для возможности отката.
+            matched_rows = result.get("matched_rows") or []
+            revert_row = result.get("revert_row") or {}
+            changes = result.get("changes") or {}
+            if matched_rows and revert_row and changes:
+                row_num = matched_rows[0]
+                old_values = {
+                    k: revert_row.get(k, "")
+                    for k in changes.keys()
+                }
+                context.user_data["last_change"] = {
+                    "kind": "update",
+                    "sheet": sheet_name,
+                    "row": row_num,
+                    "old_values": old_values,
+                }
+
             editor.update_info(result, sheet_name=sheet_name)
             chat_reply = (result.get("chat_reply") or "").strip()
             reply_text = chat_reply or f"Готово. Обновил строку {result['matched_rows'][0] - 3} на листе {sheet_name}."
@@ -204,7 +282,7 @@ async def on_text(update, context):
             context.user_data.pop("sheet", None)
             await update.message.reply_text(
                 "Выберите следующее действие:",
-                reply_markup=KEYBOARD,
+                reply_markup=KEYBOARD_WITH_CANCEL if context.user_data.get("last_change") else KEYBOARD,
             )
 
     else:
@@ -275,8 +353,8 @@ def main():
 
     request = HTTPXRequest(
         connect_timeout=30,
-        read_timeout=90,   # увеличен для скачивания голосовых файлов
-        write_timeout=60,
+        read_timeout=30,   # увеличен для скачивания голосовых файлов
+        write_timeout=30,
         proxy=PROXY or None,
     )
     app = (

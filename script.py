@@ -15,7 +15,6 @@ client = OpenAI(
     base_url="https://api.vsegpt.ru/v1",
 )
 
-
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 
@@ -72,8 +71,14 @@ class Editor:
         end_letter = self._col_number_to_letter(9)
         range_name = f"{start_letter}3:{end_letter}{last_row}"
         return sheet.get(range_name)
-
-    def insert_info(self, task_dict: dict, sheet_name=None):
+    def get_row_info(self, row_num: int, sheet_name=None, ):
+        """Возвращает значения одной строки (столбцы B–I) как список списков, как и sheet.get."""
+        sheet = self.spreadsheet.worksheet(sheet_name) if sheet_name else self.sheet
+        start_letter = self._col_number_to_letter(2)
+        end_letter = self._col_number_to_letter(9)
+        range_name = f"{start_letter}{row_num}:{end_letter}{row_num}"
+        return sheet.get(range_name)
+    def insert_info(self, task_dict: dict, sheet_name=None) -> int:
         """
         Вставляет задачу из словаря (результат decipher_add_task_command) в таблицу.
         Колонки: Статус, Задача, Категория, Ответственные, Срок, Приоритет, Комментарии/Подзадачи.
@@ -82,8 +87,6 @@ class Editor:
         """
         sheet = self.spreadsheet.worksheet(sheet_name) if sheet_name else self.sheet
         next_row = self.get_last_filled_row(col=3, sheet_name=sheet_name) + 1
-        if next_row == 1:
-            next_row = 2  # строка 1 — заголовки
         row_data = [
             "🔄",
             (task_dict.get("task") or ""),
@@ -97,7 +100,9 @@ class Editor:
         end_letter = self._col_number_to_letter(9)
         range_name = f"{start_letter}{next_row}:{end_letter}{next_row}"
         sheet.update(range_name, [row_data])
-    def update_info(self, search_result: dict, sheet_name=None):
+        # Возвращаем номер добавленной строки — удобно для последующей отмены.
+        return next_row
+    def update_info(self, search_result: dict, sheet_name=None) -> None:
         """
         Вносит изменения в таблицу по результату search_task_to_update.
         Берёт только первую подходящую задачу (matched_rows[0]), записывает в неё значения из changes.
@@ -106,11 +111,13 @@ class Editor:
         matched = search_result.get("matched_rows", [])
         changes = search_result.get("changes", {})
         if not matched or not changes:
-            return
+            raise ValueError(
+                "Нет данных для обновления: укажите matched_rows и changes в search_result"
+            )
         row = matched[0]
         raw = self.scan_table(sheet_name=sheet_name)
         if not raw:
-            return
+            raise ValueError("Таблица пуста или не удалось прочитать данные листа")
         headers = [str(h).strip() for h in raw[0]]
         sheet = self.spreadsheet.worksheet(sheet_name) if sheet_name else self.sheet
         for header_name, value in changes.items():
@@ -118,6 +125,19 @@ class Editor:
                 continue
             col = 2 + headers.index(header_name)
             sheet.update_cell(row, col, value)
+
+    def delete_row(self, row_num: int, sheet_name=None) -> None:
+        """
+        Очищает содержимое строки с колонки C по I (включительно).
+        Строка не удаляется — колонка B с формулой нумерации остаётся нетронутой.
+        Используется для отмены последнего добавления.
+        """
+        sheet = self.spreadsheet.worksheet(sheet_name) if sheet_name else self.sheet
+        start_letter = self._col_number_to_letter(3)   # C
+        end_letter = self._col_number_to_letter(9)     # I
+        range_name = f"{start_letter}{row_num}:{end_letter}{row_num}"
+        empty_row = [[""] * 7]  # 7 колонок: C, D, E, F, G, H, I
+        sheet.update(range_name, empty_row)
 
     @staticmethod
     def decipher_add_task_command(command: str, client: OpenAI) -> dict:
@@ -225,7 +245,28 @@ class Editor:
             changes_raw = {}
         changes = {k: str(v) for k, v in changes_raw.items() if k in headers}
         chat_reply = (data.get("Ответ в чате") or "").strip()
-        return {"matched_rows": matched, "changes": changes, "chat_reply": chat_reply}
+
+        # Сохраняем исходные значения строки для возможной отмены изменений.
+        revert_row = None
+        if matched:
+            try:
+                old_row_raw = self.get_row_info(sheet_name=sheet_name, row_num=matched[0])
+                if old_row_raw and len(old_row_raw[0]) > 0:
+                    row_values = old_row_raw[0]
+                    revert_row = {
+                        header: (row_values[i] if i < len(row_values) else "")
+                        for i, header in enumerate(headers)
+                    }
+            except Exception:
+                # Если не удалось прочитать строку — просто не даём возможность отката.
+                revert_row = None
+
+        return {
+            "matched_rows": matched,
+            "changes": changes,
+            "chat_reply": chat_reply,
+            "revert_row": revert_row,
+        }
 
 
 def transcribe_voice(file_path: str, client: OpenAI) -> str:
