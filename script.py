@@ -31,6 +31,11 @@ class Editor:
         self.spreadsheet = self.client.open_by_key(spreadsheet_id)
         self.sheet = self.spreadsheet.sheet1
 
+    def get_sheet_names(self) -> list[str]:
+        """Возвращает список названий всех листов таблицы (для динамического выбора объекта)."""
+        worksheets = self.spreadsheet.worksheets()
+        return [ws.title for ws in worksheets]
+
     def _col_number_to_letter(self, col: int) -> str:
         """Столбец по счёту (1, 2, 3...) в букву (A, B, C...)."""
         result = ""

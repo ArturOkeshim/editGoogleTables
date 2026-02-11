@@ -4,10 +4,10 @@
 import os
 import asyncio
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
 from telegram.error import TimedOut
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from script import Editor, client, transcribe_voice
@@ -24,18 +24,8 @@ BTN_UPDATE = "Изменить существующую задачу"
 BTN_BACK = "Назад"
 BTN_CANCEL = "Отменить последнее изменение"
 
-BTN_BCA = "БСА"
-BTN_LAPTEV = "ЛАПТЕВ"
-BTN_PUZANOV = "ПУЗАНОВ"
-BTN_AQUA = "АКВА"
-
 KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_NEW, BTN_UPDATE]],
-    resize_keyboard=True,
-)
-
-SHEET_CHOICE_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_BCA, BTN_LAPTEV, BTN_PUZANOV, BTN_AQUA], [BTN_BACK]],
     resize_keyboard=True,
 )
 
@@ -49,7 +39,34 @@ KEYBOARD_WITH_CANCEL = ReplyKeyboardMarkup(
 )
 
 
-SHEET_BUTTONS = [BTN_BCA, BTN_LAPTEV, BTN_PUZANOV, BTN_AQUA]
+async def _send_sheet_choice(bot, chat_id, context, reply_to_message_id=None):
+    """
+    Загружает список листов из таблицы и отправляет сообщение «Выберите объект» с InlineKeyboard.
+    Сохраняет список в context.user_data["sheet_list"] для обработки callback.
+    Возвращает True при успехе, False при ошибке.
+    """
+    editor = context.application.bot_data.get("editor")
+    if not editor:
+        await bot.send_message(chat_id, "Ошибка: таблица не подключена.", reply_markup=KEYBOARD)
+        return False
+    try:
+        names = editor.get_sheet_names()
+    except Exception as e:
+        await bot.send_message(chat_id, f"Не удалось загрузить список листов: {e}", reply_markup=KEYBOARD)
+        return False
+    if not names:
+        await bot.send_message(chat_id, "В таблице нет листов.", reply_markup=KEYBOARD)
+        return False
+    context.user_data["sheet_list"] = names
+    buttons = [[InlineKeyboardButton(name, callback_data=f"s:{i}")] for i, name in enumerate(names)]
+    buttons.append([InlineKeyboardButton(BTN_BACK, callback_data="sheet_back")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    kwargs = {"reply_markup": keyboard}
+    if reply_to_message_id is not None:
+        kwargs["reply_to_message_id"] = reply_to_message_id
+    await bot.send_message(chat_id, "Выберите объект:", **kwargs)
+    return True
+
 
 async def start(update, context):
     context.user_data.pop("mode", None)
@@ -71,16 +88,14 @@ async def on_button(update, context):
     if text == BTN_NEW:
         context.user_data["mode"] = "new"
         context.user_data.pop("sheet", None)
-        await update.message.reply_text(
-            "Выберите объект:",
-            reply_markup=SHEET_CHOICE_KEYBOARD,
+        await _send_sheet_choice(
+            context.bot, update.effective_chat.id, context, reply_to_message_id=update.message.message_id
         )
     elif text == BTN_UPDATE:
         context.user_data["mode"] = "update"
         context.user_data.pop("sheet", None)
-        await update.message.reply_text(
-            "Выберите объект:",
-            reply_markup=SHEET_CHOICE_KEYBOARD,
+        await _send_sheet_choice(
+            context.bot, update.effective_chat.id, context, reply_to_message_id=update.message.message_id
         )
 
     # Кнопка «Назад» — отмена / шаг назад
@@ -89,12 +104,11 @@ async def on_button(update, context):
         sheet = context.user_data.get("sheet")
         has_undo = context.user_data.get("last_change") is not None
 
-        # Если уже выбраны и режим, и объект — возвращаемся к выбору объекта
+        # Если уже выбраны и режим, и объект — возвращаемся к выбору объекта (inline-кнопки)
         if mode and sheet:
             context.user_data.pop("sheet", None)
-            await update.message.reply_text(
-                "Выберите объект:",
-                reply_markup=SHEET_CHOICE_KEYBOARD,
+            await _send_sheet_choice(
+                context.bot, update.effective_chat.id, context, reply_to_message_id=update.message.message_id
             )
         # Если выбран только режим — возвращаемся к выбору действия
         elif mode and not sheet:
@@ -156,30 +170,63 @@ async def on_button(update, context):
                 reply_markup=KEYBOARD,
             )
 
-    # Шаг 2: выбор объекта / листа
-    elif text in SHEET_BUTTONS:
-        context.user_data["sheet"] = text
-        mode = context.user_data.get("mode")
-        if mode == "new":
-            await update.message.reply_text(
-                "Напишите, что нужно сделать (опишите задачу).",
-                reply_markup=TEXT_STAGE_KEYBOARD,
-            )
-        elif mode == "update":
-            await update.message.reply_text(
-                "Напишите, что нужно изменить (например: «задача по отчёту выполнена»).",
-                reply_markup=TEXT_STAGE_KEYBOARD,
-            )
-        else:
-            # Объект выбран без выбранного действия — просим начать сначала
-            await update.message.reply_text(
-                "Сначала выберите действие: 'Новая задача' или 'Изменить существующую задачу'.",
-                reply_markup=KEYBOARD,
-            )
+    # Выбор листа теперь через InlineKeyboard (обработчик on_sheet_callback).
 
     # Остальное считаем обычным текстом и передаём в обработчик on_text
     else:
         await on_text(update, context)
+
+
+async def on_sheet_callback(update, context):
+    """
+    Обработка нажатия inline-кнопки выбора листа.
+    callback_data: "s:0", "s:1", ... — индекс листа; "sheet_back" — Назад.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = (query.data or "").strip()
+    chat_id = update.effective_chat.id
+
+    if data == "sheet_back":
+        context.user_data.pop("mode", None)
+        context.user_data.pop("sheet", None)
+        context.user_data.pop("sheet_list", None)
+        main_keyboard = KEYBOARD_WITH_CANCEL if context.user_data.get("last_change") else KEYBOARD
+        await context.bot.send_message(
+            chat_id, "Выберите действие:", reply_markup=main_keyboard
+        )
+        return
+
+    if data.startswith("s:"):
+        try:
+            idx = int(data[2:])
+        except ValueError:
+            return
+        sheet_list = context.user_data.get("sheet_list") or []
+        if idx < 0 or idx >= len(sheet_list):
+            await context.bot.send_message(chat_id, "Объект не найден. Выберите снова.", reply_markup=KEYBOARD)
+            return
+        sheet_name = sheet_list[idx]
+        context.user_data["sheet"] = sheet_name
+        mode = context.user_data.get("mode")
+        if mode == "new":
+            await context.bot.send_message(
+                chat_id,
+                f"Напишите, что нужно сделать по объекту «{sheet_name}» (опишите задачу).",
+                reply_markup=TEXT_STAGE_KEYBOARD,
+            )
+        elif mode == "update":
+            await context.bot.send_message(
+                chat_id,
+                f"Напишите, что нужно изменить в таблице «{sheet_name}» (например: «задача по отчёту выполнена»).",
+                reply_markup=TEXT_STAGE_KEYBOARD,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                "Сначала выберите действие: 'Новая задача' или 'Изменить существующую задачу'.",
+                reply_markup=KEYBOARD,
+            )
 
 
 async def on_text(update, context):
@@ -366,10 +413,11 @@ def main():
     app.bot_data["editor"] = editor
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_sheet_callback))
     app.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_button))
 
-    app.run_polling(allowed_updates=["message"])
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
